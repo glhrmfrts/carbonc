@@ -27,6 +27,8 @@
   (map 'list #'semantic-node ast))
 
 
+;;; Types
+
 (defstruct type-info name kind intrkind size alignment signed arg-validators)
 
 (defstruct local-info name tid)
@@ -165,6 +167,93 @@
   (map 'list #'type-node ast))
 
 
+(defmacro push-back (place lst)
+  `(setf ,place (nconc ,lst ,place)))
+
+
+;;; IR
+
+(defparameter *ir-instrs* nil)
+(defparameter *ir-vstack* (make-array 32))
+(defparameter *ir-vtop* 0)
+
+(defun ir-emit (irkind &rest args)
+  (push-back *ir-instrs* (list (list irkind nil args))))
+
+(defun ir-emit-typed (irkind typ &rest args)
+  (push-back *ir-instrs* (list (list irkind typ args))))
+
+(defun push-vstack (value)
+  (setf (aref *ir-vstack* *ir-vtop*) value)
+  (incf *ir-vtop*))
+
+(defun pop-vstack ()
+  (decf *ir-vtop*)
+  (aref *ir-vstack* *ir-vtop*))
+
+(defun is-arith-intrinsic (ikind)
+  (some (lambda (it) (equal it ikind)) '(:add :sub :mul)))
+
+(defun generate-ir-arith-intrinsic (typ ikind args)
+  (progn
+    (generate-ir-node (first args))
+    (generate-ir-node (second args))
+    (let* ((b (pop-vstack))
+           (a (pop-vstack)))
+      (ir-emit-typed ikind typ a b)
+      (push-vstack (list :stack typ)))))
+
+(defun generate-ir-intrinsic (node)
+  (destructuring-bind (_ typ ikind args) node
+    (declare (ignore _))
+    (cond
+      ((is-arith-intrinsic ikind)   (generate-ir-arith-intrinsic typ ikind args))
+      (t                            nil))))
+
+(defun generate-ir-node (node)
+  (let ((k (get-node-kind node)))
+    (cond
+      ((equal k :intrinsic)    (generate-ir-intrinsic node))
+      ((equal k :integer-lit)  (push-vstack node))
+      ((equal k :float-lit)    (push-vstack node)))))
+
+(defun generate-ir-instrs (ast)
+  (dolist (node ast)
+    (generate-ir-node node)))
+
+
+;;; Codegen (x64)
+
+(defun get-ir-arg (instr idx)
+  (nth (last instr) idx))
+
+(defun transform-ir-arg (arg)
+  (case (first arg)
+    (:integer-lit
+      arg
+    (:stack
+      (pop-codegen-vstack)))))
+
+(defun generate-arith-instr-assembly (instr)
+  (let* ((b (transform-ir-arg (get-ir-arg instr 1))))
+        ((a (transform-ir-arg (get-ir-arg instr 0))))
+    (if (not (regp a))
+      (progn
+        (codegen-move (reg-dest +reg-intermediate+ res-type) a)
+        (codegen-arith-op (first instr) (reg-dest +reg-intermediate+ res-type) b))
+      (codegen-arith-op (first instr) a b))))
+
+(defun generate-instr-assembly (instr)
+  (if (is-arith-intrinsic (first instr))
+    (generate-arith-instr-assembly instr)))
+
+(defun generate-assembly (instrs)
+  (dolist (instr instrs)
+    (generate-instr-assembly instr)))
+
+
+;;; Main
+
 (defun compile-file-contents (src)
   (let* ((ast (parse-unit src))
          (semtree (ast-to-semtree (car ast))))
@@ -172,4 +261,7 @@
     (format t "~A~%" ast)
     (format t "~A~%" semtree)
     (format t "~A~%" (type-tree semtree))
-    (type-tree semtree)))
+    (setf *ir-instrs* nil)
+    (generate-ir-instrs (type-tree semtree))
+    (setf *ir-instrs* (reverse *ir-instrs*))
+    *ir-instrs*))
