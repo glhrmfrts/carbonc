@@ -51,12 +51,15 @@
 (defun add-scope (kind)
   (progn
     (setf (aref (type-system-scopes *ts*) (+ (type-system-curscope *ts*) 1)) (make-lex-scope :kind kind
-                                                                                             :types (make-hash-table)
-                                                                                             :locals (make-hash-table)))
+                                                                                             :types (make-hash-table :test #'equal)
+                                                                                             :locals (make-hash-table :test #'equal)))
     (setf (type-system-curscope *ts*) (+ (type-system-curscope *ts*) 1))))
 
+(defun get-scope (idx)
+  (aref (type-system-scopes *ts*) idx))
+
 (defun current-scope ()
-  (aref (type-system-scopes *ts*) (type-system-curscope *ts*)))
+  (get-scope (type-system-curscope *ts*)))
 
 (defun register-type (id info)
   (setf (gethash id (lex-scope-types (current-scope))) info))
@@ -65,14 +68,10 @@
   (setf (gethash name (lex-scope-locals (current-scope))) (make-local-of-type name tid)))
 
 (defun is-type-kind (info kind)
-  (destructuring-bind (n k &rest rest) info
-    (declare (ignore n rest))
-    (equal k kind)))
+  (equal kind (type-info-kind info)))
 
 (defun is-integral-type (info)
-  (destructuring-bind (n k &rest rest) info
-    (declare (ignore n rest))
-    (equal k :integral)))
+  (equal :integral (type-info-kind info)))
 
 (defun create-builtin-types ()
   (progn
@@ -81,8 +80,13 @@
     (register-type "int"  (make-integral-type-info "int" 4 4 t))
     (register-type "uint" (make-integral-type-info "uint" 4 4 nil))
 
-    (register-type "+"            (make-intrinsic-type-info "+" :add (list #'is-integral-type #'is-integral-type)))
+    (register-type "+"  (make-intrinsic-type-info "+" :add (list #'is-integral-type #'is-integral-type)))
+    (register-type "-"  (make-intrinsic-type-info "-" :sub (list #'is-integral-type #'is-integral-type)))
+    (register-type "*"  (make-intrinsic-type-info "*" :mul (list #'is-integral-type #'is-integral-type)))
+
     (register-local-of-type "+"   (list *builtin-scope-idx* "+"))
+    (register-local-of-type "-"   (list *builtin-scope-idx* "-"))
+    (register-local-of-type "*"   (list *builtin-scope-idx* "*"))
 
     t))
 
@@ -92,23 +96,42 @@
 (defun print-ts ()
   (format t "~A~%" *ts*))
 
+(defun find-local (name &key (scope (type-system-curscope *ts*)))
+  (unless (< scope 0)
+    (let ((loc (gethash name (lex-scope-locals (current-scope)))))
+      (if loc
+        loc
+        (find-local name :scope (- scope 1))))))
+
+(defun get-local-type (local)
+  (when local (local-info-tid local)))
+
 (defun get-node-kind (node)
   (first node))
 
 (defun get-node-type (node)
   (second node))
 
+(defun get-node-type-info (node)
+  (destructuring-bind (scopeidx id) (second node)
+    (gethash id (lex-scope-types (get-scope scopeidx)))))
+
 (defun every-type (nodes)
   (every (lambda (it) (not (null (get-node-type it)))) nodes))
 
 (defun type-symbol (id)
-  (list :symbol '(0 "int") id))
+  (let* ((local (find-local id))
+         (ltype (get-local-type local)))
+    (cond
+      ((and local ltype)    (list :symbol ltype id))
+      (t                    (list :symbol nil id)))))
 
 (defun type-intrinsic (fn args)
-  (let* ((tfn           (get-node-type fn))
+  (let* ((tfn           (get-node-type-info fn))
          (validators    (type-info-arg-validators tfn))
          (argtypes      (map 'list #'get-node-type args))
-         (argval        (mapcar #'list argtypes validators))
+         (argtypeinfos  (map 'list #'get-node-type-info args))
+         (argval        (mapcar #'list argtypeinfos validators))
          (args-match    (every (lambda (it) (funcall (second it) (first it))) argval)))
     (cond 
       (args-match       (list :intrinsic (first argtypes) (type-info-intrkind tfn) args))
@@ -118,13 +141,14 @@
   (let* ((tfn               (type-node fn))
          (targs             (type-tree args))
          (all-resolved      (and (not (null (get-node-type tfn))) (every-type targs))))
+    (format t "~A~%" (get-node-type tfn))
     (cond
-      ((and all-resolved (is-type-kind (get-node-type tfn) :intrinsic)) (type-intrinsic tfn targs))
-      (t                                                                (list :call nil tfn targs)))))
+      ((and all-resolved (is-type-kind (get-node-type-info tfn) :intrinsic)) (type-intrinsic tfn targs))
+      (t                                                                     (list :call nil tfn targs)))))
 
 (defun type-node (node)
   (if (or (not (listp node)) (< (length node) 2))
-    node    
+    node
     (destructuring-bind (k typ &rest content) node
       (declare (ignore typ))
       (format t "~A~%" content)
